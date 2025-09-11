@@ -68,8 +68,8 @@ def init_openai(dotenv_path: Optional[str]) -> OpenAI:
 def init_tesseract_quiet() -> None:
     cmd: Optional[str] = None
     if platform.system() == "Windows":
-        for c in (r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
-                  r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe"):
+        for c in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                  r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
             if os.path.exists(c):
                 cmd = c
                 break
@@ -81,7 +81,6 @@ def init_tesseract_quiet() -> None:
         if os.path.isdir(td):
             os.environ.setdefault("TESSDATA_PREFIX", td)
             break
-
 
 # -------------------- Utilities --------------------
 
@@ -129,12 +128,37 @@ def load_eligible_qrs(db_path: str, table: str) -> Set[str]:
     return eligible
 
 
+def _ensure_min_size_array(arr: np.ndarray, min_w: int = 128, min_h: int = 32) -> np.ndarray:
+    """Upscale defensivo para evitar erros do Tesseract/limiares com imagens pequenas."""
+    if arr is None or arr.size == 0:
+        return arr
+    h, w = arr.shape[:2]
+    if w >= min_w and h >= min_h:
+        return arr
+    sx = max(1.0, min_w / max(w, 1))
+    sy = max(1.0, min_h / max(h, 1))
+    s = max(sx, sy)
+    if cv2 is not None:
+        return cv2.resize(arr, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
+    # fallback via PIL
+    pil = Image.fromarray(arr.astype(np.uint8))
+    new_size = (max(1, int(w * s)), max(1, int(h * s)))
+    return np.array(pil.resize(new_size, Image.NEAREST))
+
+
 def encode_image_from_path(image_path: str) -> Optional[str]:
     try:
-        mime = "image/jpeg"
         ext = os.path.splitext(image_path)[1].lower()
         if ext == ".png":
             mime = "image/png"
+        elif ext in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+        elif ext == ".webp":
+            mime = "image/webp"
+        elif ext == ".bmp":
+            mime = "image/bmp"
+        else:
+            mime = "application/octet-stream"
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         return f"data:{mime};base64,{b64}"
@@ -190,7 +214,10 @@ def crop_header_top(image_path: str, fraction: float = HEADER_FRACTION) -> Optio
 
 
 def _binarize_gray(gray: np.ndarray) -> np.ndarray:
-    thresh = float(np.mean(gray)) if gray.size else 127.0
+    if gray is None or gray.size == 0:
+        return gray
+    # limiar simples por média (fallback para caminho sem OpenCV)
+    thresh = float(np.mean(gray))
     return ((gray > thresh).astype(np.uint8) * 255)
 
 
@@ -201,15 +228,32 @@ def quick_ocr_text(img_path: str) -> str:
             if img is None:
                 return ""
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY)
-            return pt.image_to_string(bw, config="--oem 3 --psm 6 -l eng") or ""
+
+            # Upscale defensivo antes do limiar
+            gray = _ensure_min_size_array(gray, min_w=128, min_h=32)
+
+            # Otsu com fallback adaptativo
+            try:
+                _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            except Exception:
+                bw = cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 5
+                )
+
+            # OCR: psm 7 costuma ler melhor etiqueta/linha
+            return pt.image_to_string(bw, config="--oem 3 --psm 7 -l eng") or ""
+
+        # Caminho sem OpenCV (PIL)
         img = Image.open(img_path).convert("L")
         arr = np.array(img)
+        arr = _ensure_min_size_array(arr, min_w=128, min_h=32)
         bw = _binarize_gray(arr)
-        return pt.image_to_string(bw, config="--oem 3 --psm 6 -l eng") or ""
+        return pt.image_to_string(bw, config="--oem 3 --psm 7 -l eng") or ""
+
+    except pt.TesseractError:
+        return ""
     except Exception:
         return ""
-
 
 def find_ubc_tag_hint_from_el1(img_path: Optional[str]) -> str:
     if not img_path:
@@ -243,7 +287,12 @@ def build_groups(image_dir: str, eligible_qrs: Set[str], qr_filter: Optional[str
 
 # -------------------- OpenAI Extraction --------------------
 
-def ask_model(client: OpenAI, header_img_b64: Optional[str], el1_b64: Optional[str], el2_b64: Optional[str], ubc_hint: str) -> Dict[str, str]:
+def ask_model(client: OpenAI,
+              header_img_b64: Optional[str],
+              el1_b64: Optional[str],
+              el2_b64: Optional[str],
+              ubc_hint: str) -> Dict[str, str]:
+
     content: List[Dict] = []
     prompt = (
         "You will see up to three images for an ELECTRICAL PANEL.\n\n"
@@ -277,6 +326,7 @@ def ask_model(client: OpenAI, header_img_b64: Optional[str], el1_b64: Optional[s
     except Exception:
         return {}
 
+    # Strip code fences if present
     if raw.startswith("```json"):
         raw = raw[7:].strip()
     elif raw.startswith("```"):
@@ -315,15 +365,18 @@ def process_group(client: OpenAI, qr: str, building: str, paths: Dict[str, str],
     # Minimal fallback structure
     if not isinstance(data, dict):
         data = {}
+
     ubc_val = (data.get("UBC Asset Tag", "") or "").upper().strip()
     if not UBC_TAG_CANDIDATE.search(ubc_val):
         ubc_val = ""
+
     branch_panel = (data.get("Branch Panel", "") or "").upper().strip()
     if not ubc_val and branch_panel:
         ubc_val = branch_panel
 
     data["UBC Asset Tag"] = ubc_val
     data["Description"] = f"Panel - {ubc_val}" if ubc_val else "Panel - "
+
     for k in ["Ampere", "Supply From", "Volts", "Location", "Branch Panel"]:
         v = str(data.get(k, "") or "").strip()
         if v == ".":

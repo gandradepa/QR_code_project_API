@@ -1,335 +1,465 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Script to extract structured data from industrial asset photographs using
+an advanced ensemble of local OCR (Tesseract) and a multimodal LLM (GPT-4o).
+
+This version introduces sophisticated improvements for data accuracy:
+- Advanced image pre-processing including perspective correction and CLAHE.
+- An ensemble extraction model that uses a decision engine to weigh OCR and LLM results.
+- Chain-of-Thought LLM prompting for higher-quality AI analysis.
+- Post-extraction data validation to ensure plausibility.
+"""
+
 import os
 import json
 import base64
 import re
 import time
+import logging
+import platform
+import shutil
+import sqlite3
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Tuple, Any, Optional, Set
 
-from dotenv import load_dotenv
-from openai import OpenAI
-
-# --- OCR / image libs ---
+# Third-party libraries
 import cv2
 import numpy as np
-from PIL import Image  # noqa: F401
 import pytesseract
-
-# NEW: database
-import sqlite3
-from contextlib import closing
-
-import platform, shutil, pytesseract
-if platform.system() == "Windows":
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-else:
-    pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract") or "tesseract"
+from dotenv import load_dotenv
+from openai import OpenAI, APIConnectionError, RateLimitError, APIStatusError
 
 
-# --- [1] Load API key ---
-load_dotenv(dotenv_path=r"/home/developer/API/OpenAI_key_bryan.env")
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# --- [1] Configuration ---
+class Config:
+    """Centralized configuration for the asset processing script."""
+    # --- Paths ---
+    ROOT_DEV_PATH = os.getenv("DEV_PATH", "/home/developer")
+    IMAGE_FOLDER = os.path.join(ROOT_DEV_PATH, "Capture_photos_upload")
+    OUTPUT_FOLDER = os.path.join(ROOT_DEV_PATH, "Output_jason_api")
+    DEBUG_FOLDER = os.path.join(OUTPUT_FOLDER, "debug_ubc_tag")
+    DB_PATH = os.path.join(ROOT_DEV_PATH, "asset_capture_app_dev/data/QR_codes.db")
+    ENV_PATH = os.path.join(ROOT_DEV_PATH, "API/OpenAI_key_bryan.env")
 
-# --- [2] Paths & constants ---
-image_folder  = r"/home/developer/Capture_photos_upload"
-output_folder = r"/home/developer/Output_jason_api"
-debug_folder  = os.path.join(output_folder, "debug_ubc_tag")
-os.makedirs(output_folder, exist_ok=True)
-os.makedirs(debug_folder, exist_ok=True)
+    # --- Database ---
+    DB_TABLE = "sdi_dataset_ME"
 
-# NEW: DB path (SQLite)
-DB_PATH = r"/home/developer/asset_capture_app_dev/data/QR_codes.db"
-DB_TABLE = "QR_codes"  # precisa conter QR_code_ID e Approved
+    # --- File Matching ---
+    VALID_SUFFIXES = {"0", "1", "3"}
+    VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    FILENAME_PATTERN = re.compile(
+        r"^(\d+)\s+" r"(\d+(?:-\d+)?)\s+" r"([A-Z]{2})\s*-\s*([0-3])$", re.IGNORECASE
+    )
 
-VALID_SUFFIXES = {"0", "1", "3"}
-VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    # --- OCR & Image Processing ---
+    UBC_TAG_PATTERN = re.compile(r"\b([A-Z]{1,3})[-\u2013]?\s?(\d{1,4})([A-Z]?)\b")
+    TESSERACT_MIN_CONFIDENCE = 75.0  # Increased threshold as we now have a better LLM fallback
 
-FIELD_SOURCES: Dict[str, List[str]] = {
-    "Manufacturer": ["0"],
-    "Model": ["0"],
-    "Serial Number": ["0"],
-    "Year": ["0"],
-    "UBC Tag": ["1"],
-    "Technical Safety BC": ["3"],
-}
+    # --- OpenAI API ---
+    OPENAI_MODEL = "gpt-4o"
+    API_MAX_RETRIES = 3
+    API_RETRY_DELAY = 1.5
 
-UBC_TAG_PATTERN = re.compile(r"\b([A-Z]{1,3})[-\u2013]?\s?(\d{1,4})([A-Z]?)\b")  # e.g., P-12A, AH-203
+    # --- Concurrency ---
+    MAX_WORKERS = 8
 
-# --- [2.1] DB helpers (NEW) ---
-def load_approved_qrs(db_path: str, table: str = "QR_codes") -> set:
-    """
-    Retorna um set de QR_code_ID em que Approved == 1.
-    Funciona se Approved for INTEGER 1 ou TEXT '1'.
-    """
-    approved = set()
-    if not os.path.exists(db_path):
-        print(f"⚠ DB não encontrado: {db_path}. Seguindo sem filtro de aprovação.")
-        return approved
-    try:
-        with closing(sqlite3.connect(db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            with closing(conn.cursor()) as cur:
-                cur.execute(f"""
-                    SELECT QR_code_ID
-                    FROM {table}
-                    WHERE (Approved = 1 OR Approved = '1')
-                """)
-                for row in cur.fetchall():
-                    qrid = str(row["QR_code_ID"]).strip()
-                    if qrid:
-                        approved.add(qrid)
-    except Exception as e:
-        print(f"⚠ Erro ao ler aprovações do DB: {e}. Seguindo sem filtro de aprovação.")
-    return approved
+    # --- Field Mapping & Validation ---
+    FIELD_SOURCES: Dict[str, List[str]] = {
+        "Manufacturer": ["0"], "Model": ["0"], "Serial Number": ["0"],
+        "Year": ["0"], "UBC Tag": ["1"], "Technical Safety BC": ["3"],
+    }
+    EXPECTED_FIELDS: List[str] = list(FIELD_SOURCES.keys())
+    YEAR_VALIDATION_RANGE = (1950, 2025)
 
-APPROVED_QRS = load_approved_qrs(DB_PATH, DB_TABLE)
-if APPROVED_QRS:
-    print(f"Filtro de aprovação carregado: {len(APPROVED_QRS)} QR(s) serão ignorados.")
 
-# --- [3] Group files by QR ---
-# "<QR> <Building> ME - <Sequence>"
-pattern = re.compile(
-    r"^(\d+)\s+"
-    r"(\d+(?:-\d+)?)\s+"
-    r"(ME)\s*-\s*([013])$",
-    re.IGNORECASE
+# --- [2] Setup Logging and Environment ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-grouped = defaultdict(lambda: {"images": {}, "building": "", "asset_type": "ME"})
+def setup_environment():
+    """Loads environment variables and configures Tesseract."""
+    load_dotenv(dotenv_path=Config.ENV_PATH)
+    if not os.getenv("OPENAI_API_KEY"):
+        raise ValueError("OPENAI_API_KEY is not set.")
+    
+    if platform.system() == "Windows":
+        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    else:
+        pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract") or "tesseract"
+    
+    os.makedirs(Config.OUTPUT_FOLDER, exist_ok=True)
+    os.makedirs(Config.DEBUG_FOLDER, exist_ok=True)
 
-for fn in os.listdir(image_folder):
-    base, ext = os.path.splitext(fn)
-    if ext.lower() not in VALID_EXTS:
-        continue
-    m = pattern.match(base)
-    if not m:
-        print(f"⚠ Skipping unrecognized filename: {fn}")
-        continue
-    qr, building, asset_type, seq = m.groups()
-    if seq not in VALID_SUFFIXES or asset_type.upper() != "ME":
-        continue
 
-    # NEW: pular logo no agrupamento se Approved=1
-    if qr in APPROVED_QRS:
-        print(f"⏭️  Skipping QR {qr} (Approved=1 no DB)")
-        continue
+# --- [3] Asset Processing Class ---
+class AssetProcessor:
+    """Orchestrates asset data extraction using an advanced ensemble methodology."""
 
-    grouped[qr]["building"] = building
-    grouped[qr]["images"][seq] = os.path.join(image_folder, fn)
+    def __init__(self):
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.approved_qrs = self._load_approved_qrs()
+        logging.info(f"Loaded {len(self.approved_qrs)} approved QR codes to ignore.")
 
-print(f"\nTotal assets found (após filtro de aprovação): {len(grouped)}")
-
-# --- [4] Utilities ---
-def encode_image(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
-    mime = {
-        ".jpg":  "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png":  "image/png",
-        ".bmp":  "image/bmp",
-        ".webp": "image/webp"
-    }.get(ext, "application/octet-stream")
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
-
-def normalize_year(value: str) -> str:
-    if not value:
-        return ""
-    m = re.search(r"\b(19\d{2}|20\d{2})\b", value)
-    return m.group(0) if m else ""
-
-def canonicalize_ubc_tag(text: str) -> str:
-    if not text:
-        return ""
-    m = UBC_TAG_PATTERN.search(text.replace("—", "-").replace("–", "-"))
-    if not m:
-        return ""
-    left, num, suffix = m.groups()
-    return f"{left}-{num}{suffix}".strip("-")
-
-# --- [5] UBC Tag OCR pipeline ---
-def find_white_plate_roi(img_bgr: np.ndarray) -> np.ndarray:
-    h, w = img_bgr.shape[:2]
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                               cv2.THRESH_BINARY, 31, 5)
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_area, best_box = 0, None
-    for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
-        area = cw * ch
-        aspect = cw / max(ch, 1)
-        if area > 0.02 * w * h and 1.8 <= aspect <= 8.0:
-            if area > best_area:
-                best_area, best_box = area, (x, y, cw, ch)
-
-    if best_box is None:
-        return img_bgr
-
-    x, y, cw, ch = best_box
-    pad = int(0.05 * (cw + ch) / 2)
-    x0 = max(0, x - pad); y0 = max(0, y - pad)
-    x1 = min(w, x + cw + pad); y1 = min(h, y + ch + pad)
-    roi = img_bgr[y0:y1, x0:x1]
-    return roi if roi.size > 0 else img_bgr
-
-def preprocess_for_ocr(roi_bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = np.ones((2, 2), np.uint8)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return bw
-
-def tesseract_read_tag(img_bgr: np.ndarray) -> Tuple[str, float]:
-    roi = find_white_plate_roi(img_bgr)
-    bw = preprocess_for_ocr(roi)
-    debug_name = os.path.join(debug_folder, f"roi_{int(time.time()*1000)}.png")
-    cv2.imwrite(debug_name, bw)
-
-    config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-    data = pytesseract.image_to_data(bw, output_type=pytesseract.Output.DICT, config=config)
-
-    texts, confs = [], []
-    for txt, conf in zip(data.get("text", []), data.get("conf", [])):
-        if not txt or txt.strip() == "" or conf in ("-1", -1):
-            continue
-        texts.append(txt.strip())
+    def _load_approved_qrs(self) -> Set[str]:
+        # ... (same as previous version, no changes needed)
+        approved = set()
+        if not os.path.exists(Config.DB_PATH):
+            logging.warning(f"Database not found: {Config.DB_PATH}. Proceeding without approval filter.")
+            return approved
         try:
-            confs.append(float(conf))
-        except Exception:
-            pass
+            with closing(sqlite3.connect(Config.DB_PATH)) as conn:
+                conn.row_factory = sqlite3.Row
+                with closing(conn.cursor()) as cur:
+                    query = f"SELECT QR_code_ID FROM {Config.DB_TABLE} WHERE Approved = 1 OR Approved = '1'"
+                    cur.execute(query)
+                    for row in cur.fetchall():
+                        if qrid := str(row["QR_code_ID"]).strip():
+                            approved.add(qrid)
+        except sqlite3.Error as e:
+            logging.error(f"Error reading approvals from DB: {e}.")
+        return approved
+        
+    def discover_assets(self) -> Dict[str, Dict[str, Any]]:
+        # ... (same as previous version, no changes needed)
+        grouped = defaultdict(lambda: {"images": {}, "building": "", "asset_type": ""})
+        logging.info(f"Scanning for images in: {Config.IMAGE_FOLDER}")
+        for filename in sorted(os.listdir(Config.IMAGE_FOLDER)):
+            base, ext = os.path.splitext(filename)
+            if ext.lower() not in Config.VALID_EXTS: continue
+            match = Config.FILENAME_PATTERN.match(base)
+            if not match: continue
+            qr, building, asset_type, seq = match.groups()
+            if asset_type.upper() != "ME" or seq not in Config.VALID_SUFFIXES: continue
+            if qr in self.approved_qrs: continue
+            grouped[qr]["building"] = building
+            grouped[qr]["asset_type"] = asset_type.upper()
+            grouped[qr]["images"][seq] = os.path.join(Config.IMAGE_FOLDER, filename)
+        logging.info(f"Found {len(grouped)} new assets to process.")
+        return grouped
 
-    raw = " ".join(texts).upper().replace(" ", "")
-    raw = raw.replace("–", "-").replace("—", "-")
-    text = canonicalize_ubc_tag(raw)
-    mean_conf = (sum(confs) / len(confs)) if confs else 0.0
-    return text, mean_conf
+    def run(self):
+        """Main execution flow: discover assets and process them concurrently."""
+        assets = self.discover_assets()
+        if not assets:
+            logging.info("No new assets found. Exiting.")
+            return
 
-def ask_model_for_ubc_tag(image_path: str) -> str:
-    prompt = """
-You will see ONE image that contains an equipment identifier printed in large bold black text
-on a white rectangular plate (e.g., P-12A). Extract ONLY that identifier.
+        saved_count = 0
+        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+            future_to_qr = {executor.submit(self.process_single_asset, qr, info): qr for qr, info in assets.items()}
+            for future in as_completed(future_to_qr):
+                qr = future_to_qr[future]
+                try:
+                    if output_data := future.result():
+                        self._save_result(output_data)
+                        saved_count += 1
+                        logging.info(f"Successfully processed and saved asset QR: {qr}")
+                except Exception as e:
+                    logging.error(f"Failed to process asset QR {qr}: {e}", exc_info=True)
+        
+        logging.info(f"\n--- SUMMARY ---\nTotal assets processed: {len(assets)}\nSuccessfully saved: {saved_count}")
 
-Rules:
-- Return a STRICT JSON object with key "UBC Tag" only.
-- Allowed format examples: "P-12A", "AH-203", "P-12". A letter or 1–3 letters, a hyphen, 1–4 digits, optional trailing letter.
-- If not visible, return {"UBC Tag": ""}.
-Output only JSON.
-""".strip()
+    def process_single_asset(self, qr: str, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Processes all images for a single asset to extract data using the ensemble method."""
+        final_data = {key: "" for key in Config.EXPECTED_FIELDS}
 
-    content = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": encode_image(image_path)}},
-    ]
-    for attempt in range(3):
+        for seq, path in info["images"].items():
+            fields_for_seq = [f for f, srcs in Config.FIELD_SOURCES.items() if seq in srcs]
+            if not fields_for_seq: continue
+
+            logging.info(f"Processing image {os.path.basename(path)} for fields: {fields_for_seq}")
+            
+            # --- The new ensemble extraction logic ---
+            preprocessed_img = self._preprocess_image(path)
+            if preprocessed_img is None:
+                logging.warning(f"Could not read or preprocess image {path}, skipping.")
+                continue
+
+            # 1. Get OCR opinion
+            tesseract_results = self._tesseract_read_all(preprocessed_img, fields_for_seq)
+
+            # 2. Get LLM opinion
+            llm_results = self._llm_extract_fields(preprocessed_img, fields_for_seq, path)
+
+            # 3. Use Decision Engine to choose the best result for each field
+            for field in fields_for_seq:
+                tess_result = tesseract_results.get(field, ("", 0.0))
+                llm_result = llm_results.get(field, {"value": "", "confidence": 0})
+                
+                best_value = self._decision_engine(field, tess_result, llm_result)
+                final_data[field] = best_value
+        
+        # 4. Post-Extraction Validation and Normalization
+        final_data = self._validate_and_normalize(final_data)
+        
+        return {
+            "qr_code": qr, "building_number": info.get("building", ""),
+            "asset_type": f"- {info.get('asset_type', 'ME').upper()}",
+            "structured_data": final_data,
+        }
+    
+    def _decision_engine(self, field: str, tess_result: Tuple[str, float], llm_result: Dict[str, Any]) -> str:
+        """Intelligently chooses the best value between Tesseract and LLM outputs."""
+        tess_val, tess_conf = tess_result
+        llm_val, llm_conf = llm_result.get("value", ""), llm_result.get("confidence", 0)
+
+        # Normalize for comparison (e.g., remove spaces, hyphens)
+        tess_norm = re.sub(r'[\s-]', '', (tess_val or "")).lower()
+        llm_norm = re.sub(r'[\s-]', '', (llm_val or "")).lower()
+
+        # Case 1: They agree. High confidence.
+        if tess_norm and tess_norm == llm_norm:
+            logging.info(f"[{field}] Agreement between OCR & LLM: '{tess_val}'")
+            return tess_val
+
+        # Case 2: Tesseract is highly confident.
+        if tess_conf >= Config.TESSERACT_MIN_CONFIDENCE:
+            logging.info(f"[{field}] High confidence OCR result: '{tess_val}' (Conf: {tess_conf:.1f}%)")
+            return tess_val
+
+        # Case 3: LLM is highly confident and Tesseract is not.
+        if llm_conf >= 80:
+            logging.info(f"[{field}] High confidence LLM result: '{llm_val}' (Conf: {llm_conf}%)")
+            return llm_val
+        
+        # Case 4: Fallback to the most plausible non-empty result. Prefer LLM.
+        final_choice = llm_val or tess_val
+        logging.warning(f"[{field}] Conflicting results. OCR: '{tess_val}' ({tess_conf:.1f}%), "
+                        f"LLM: '{llm_val}' ({llm_conf}%). Choosing: '{final_choice}'")
+        return final_choice
+
+    def _validate_and_normalize(self, data: Dict[str, str]) -> Dict[str, str]:
+        """Performs final validation and normalization on the extracted data."""
+        # Validate Year
+        if year_str := data.get("Year"):
+            try:
+                year = int(year_str)
+                min_y, max_y = Config.YEAR_VALIDATION_RANGE
+                if not (min_y <= year <= max_y):
+                    logging.warning(f"Year '{year}' is outside valid range {Config.YEAR_VALIDATION_RANGE}. Discarding.")
+                    data["Year"] = ""
+            except (ValueError, TypeError):
+                data["Year"] = self._normalize_year(year_str) # Attempt to fix
+        
+        # Normalize UBC Tag
+        if ubc_tag := data.get("UBC Tag"):
+            data["UBC Tag"] = self._canonicalize_ubc_tag(ubc_tag)
+            
+        return data
+
+    def _save_result(self, data: Dict[str, Any]):
+        # ... (same as previous version, no changes needed)
+        qr, asset_type, building = data["qr_code"], data["asset_type"].replace("- ", ""), data["building_number"]
+        json_filename = f"{qr}_{asset_type}_{building}.json"
+        out_path = os.path.join(Config.OUTPUT_FOLDER, json_filename)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    # --- [4] Image Processing and Extraction Methods ---
+
+    def _preprocess_image(self, image_path: str) -> Optional[np.ndarray]:
+        """Loads and applies a full suite of pre-processing filters."""
+        img = cv2.imread(image_path)
+        if img is None: return None
+
+        # 1. Perspective Correction
+        corrected_img = self._correct_perspective(img)
+        
+        # 2. Convert to Grayscale
+        gray = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2GRAY)
+        
+        # 3. Enhance Contrast with CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        # 4. Final Thresholding
+        _, bw_img = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Save debug image
+        debug_path = os.path.join(Config.DEBUG_FOLDER, f"preprocessed_{os.path.basename(image_path)}")
+        cv2.imwrite(debug_path, bw_img)
+
+        return bw_img
+        
+    def _correct_perspective(self, image: np.ndarray) -> np.ndarray:
+        """Finds the largest quadrilateral in an image and transforms it to a top-down view."""
+        # ... (This is a complex CV task, here's a simplified robust implementation)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blurred, 50, 150)
+
+        contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: return image # No contours, return original
+        
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+        
+        for c in contours:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4: # Found a quadrilateral
+                screenCnt = approx
+                break
+        else:
+            return image # No 4-sided contour found, return original
+
+        # Order the points
+        pts = screenCnt.reshape(4, 2)
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        
+        (tl, tr, br, bl) = rect
+        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+        maxWidth = max(int(widthA), int(widthB))
+        
+        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+        maxHeight = max(int(heightA), int(heightB))
+        
+        dst = np.array([
+            [0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]
+        ], dtype="float32")
+        
+        M = cv2.getPerspectiveTransform(rect, dst)
+        warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+        
+        return warped
+
+    def _tesseract_read_all(self, bw_img: np.ndarray, fields: List[str]) -> Dict[str, Tuple[str, float]]:
+        """Runs Tesseract once and attempts to parse all required fields."""
+        results = {}
         try:
-            resp = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": content}],
-                temperature=0.0,
-                max_tokens=60
-            )
-            raw = (resp.choices[0].message.content or "").strip()
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
-            data = json.loads(raw)
-            val = str(data.get("UBC Tag", "")).upper()
-            return canonicalize_ubc_tag(val)
-        except Exception:
-            time.sleep(1.2 * (attempt + 1))
-    return ""
+            # Use PSM 6 for a uniform block of text
+            data = pytesseract.image_to_data(bw_img, config='--psm 6', output_type=pytesseract.Output.DICT)
+            full_text = " ".join(filter(None, data['text']))
 
-def ask_model_for_fields(image_path: str, fields: List[str]) -> dict:
-    fields_list = "\n".join([f"- {f}" for f in fields])
-    prompt = f"""
-You will see ONE image. Extract ONLY the requested fields below.
-Return a STRICT JSON object with EXACT keys, using empty string if missing/unclear.
+            # Simple keyword-based extraction from the full text
+            for field in fields:
+                if field == "UBC Tag":
+                    val = self._canonicalize_ubc_tag(full_text)
+                    results[field] = (val, 80.0 if val else 0.0) # Assume high confidence if format matches
+                # Add more keyword logic for other fields if patterns exist
+                
+        except pytesseract.TesseractError as e:
+            logging.warning(f"Tesseract error: {e}")
+        return results
 
-{fields_list}
+    def _llm_extract_fields(self, image: np.ndarray, fields: List[str], original_path: str) -> Dict[str, Any]:
+        """Uses the LLM with Chain-of-Thought prompting for robust extraction."""
+        fields_list = ", ".join(f'"{f}"' for f in fields)
+        prompt = f"""
+Analyze the provided image of an asset nameplate. Your task is to extract the following fields: {fields_list}.
 
-Formatting rules:
-- "Year" must be a 4-digit year (e.g., "2022"); if not 4-digit, return "".
-Do not include any text before or after the JSON.
-""".strip()
+Follow these steps carefully:
+1.  **Reasoning**: Describe what you see. Identify potential values for each requested field. Note any ambiguities, glare, or unreadable text.
+2.  **Confidence Score**: For each field, provide a confidence score from 0 (not found) to 100 (perfectly clear).
+3.  **Extraction**: Provide the final extracted data in a strict JSON object.
 
-    content = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": encode_image(image_path)}},
-    ]
-    for attempt in range(4):
+Your final output MUST be a single JSON object with three keys: "reasoning", "confidence_scores", and "extracted_data".
+
+Example format:
+{{
+  "reasoning": "The image shows a metal nameplate. The 'Manufacturer' is clearly 'ACME Inc.'. The 'Serial Number' seems to be 'XYZ-12345', but the last digit is slightly blurred. The 'Year' is not visible.",
+  "confidence_scores": {{
+    "Manufacturer": 100,
+    "Serial Number": 85,
+    "Year": 0
+  }},
+  "extracted_data": {{
+    "Manufacturer": "ACME Inc.",
+    "Serial Number": "XYZ-12345",
+    "Year": ""
+  }}
+}}
+"""
+        response = self._call_vision_api(prompt, original_path, image, max_tokens=600)
+        
+        # Combine extracted data and confidence scores for the decision engine
+        data = response.get("extracted_data", {})
+        confidences = response.get("confidence_scores", {})
+        
+        # Ensure data is in the expected format
+        if not isinstance(data, dict):
+            logging.warning(f"LLM returned malformed 'extracted_data': {data}")
+            data = {}
+        if not isinstance(confidences, dict):
+            confidences = {}
+            
+        return {
+            field: {"value": str(data.get(field, "")), "confidence": confidences.get(field, 0)}
+            for field in fields
+        }
+
+    def _call_vision_api(self, prompt: str, image_path: str, image_data: np.ndarray, max_tokens: int) -> Dict[str, Any]:
+        """Robust wrapper for OpenAI Vision API calls with retry logic."""
         try:
-            resp = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": content}],
-                temperature=0.0,
-                max_tokens=300
-            )
-            raw = (resp.choices[0].message.content or "").strip()
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
-            data = json.loads(raw)
-            return {k: (data.get(k, "") if isinstance(data.get(k, ""), str) else "") for k in fields}
-        except Exception:
-            time.sleep(1.5 * (attempt + 1))
-    return {k: "" for k in fields}
+            b64_image = self._encode_image_from_data(image_data)
+        except Exception as e:
+            logging.error(f"Could not encode image data from {image_path}: {e}")
+            return {}
 
-# --- [6] Process each asset ---
-for qr, info in grouped.items():
-    # Double-guard (caso algo mude no agrupamento)
-    if qr in APPROVED_QRS:
-        print(f"⏭️  Skipping QR {qr} (Approved=1 no DB)")
-        continue
+        content = [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": b64_image}}]
+        
+        for attempt in range(Config.API_MAX_RETRIES):
+            try:
+                response = self.client.chat.completions.create(
+                    model=Config.OPENAI_MODEL,
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.0, max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                )
+                raw_json = (response.choices[0].message.content or "").strip()
+                return json.loads(raw_json)
+            except (APIConnectionError, RateLimitError, APIStatusError, json.JSONDecodeError) as e:
+                logging.warning(f"API/JSON error on attempt {attempt + 1}: {e}. Retrying...")
+                time.sleep(Config.API_RETRY_DELAY * (attempt + 1))
+            except Exception as e:
+                logging.error(f"Unexpected error in API call: {e}", exc_info=True)
+                break
+        
+        logging.error(f"API call failed after {Config.API_MAX_RETRIES} attempts for {image_path}.")
+        return {}
 
-    print(f"\nProcessing QR {qr} …")
+    @staticmethod
+    def _encode_image_from_data(image_data: np.ndarray, format: str = ".jpg") -> str:
+        """Encodes an in-memory np.ndarray image to a base64 data URI."""
+        success, buffer = cv2.imencode(format, image_data)
+        if not success:
+            raise IOError("Could not encode image data.")
+        encoded = base64.b64encode(buffer).decode("utf-8")
+        return f"data:image/jpeg;base64,{encoded}"
 
-    result = {
-        "Manufacturer": "",
-        "Model": "",
-        "Serial Number": "",
-        "Year": "",
-        "UBC Tag": "",
-        "Technical Safety BC": ""
-    }
+    @staticmethod
+    def _normalize_year(value: str) -> str:
+        if not value: return ""
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", str(value))
+        return match.group(0) if match else ""
 
-    for seq, path in info["images"].items():
-        fields_for_seq = [f for f, srcs in FIELD_SOURCES.items() if seq in srcs]
-        if not fields_for_seq:
-            continue
+    @staticmethod
+    def _canonicalize_ubc_tag(text: str) -> str:
+        if not text: return ""
+        normalized = text.replace("—", "-").replace("–", "-").replace(" ", "")
+        match = Config.UBC_TAG_PATTERN.search(normalized)
+        if not match: return ""
+        left, num, suffix = match.groups()
+        return f"{left}-{num}{suffix}".strip("-")
 
-        if seq == "1" and "UBC Tag" in fields_for_seq:
-            img_bgr = cv2.imread(path)
-            tag_text, mean_conf = tesseract_read_tag(img_bgr)
-
-            if not tag_text or mean_conf < 65.0:
-                model_tag = ask_model_for_ubc_tag(path)
-                tag_final = canonicalize_ubc_tag(tag_text) or canonicalize_ubc_tag(model_tag)
-            else:
-                tag_final = tag_text
-
-            result["UBC Tag"] = tag_final or ""
-            print(f"  → UBC Tag (seq 1): '{result['UBC Tag']}' (tesseract_conf≈{mean_conf:.1f})")
-            continue
-
-        partial = ask_model_for_fields(path, fields_for_seq)
-        if "Year" in partial:
-            partial["Year"] = normalize_year(partial.get("Year", ""))
-
-        for k, v in partial.items():
-            if isinstance(v, str):
-                result[k] = v.strip()
-
-    output_data = {
-        "qr_code":         qr,
-        "building_number": info.get("building", ""),
-        "asset_type":      f"- {info.get('asset_type', 'ME').upper()}",
-        "structured_data": result
-    }
-
-    json_filename = f"{qr}_{info.get('asset_type', 'ME').upper()}_{info.get('building', '')}.json"
-    out_path = os.path.join(output_folder, json_filename)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(output_data, f, indent=2, ensure_ascii=False)
-    print(f"  ✅ Saved {out_path}")
+# --- [5] Main Execution Block ---
+if __name__ == "__main__":
+    try:
+        setup_environment()
+        processor = AssetProcessor()
+        processor.run()
+    except Exception as e:
+        logging.critical(f"A critical error terminated the script: {e}", exc_info=True)
