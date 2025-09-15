@@ -4,11 +4,11 @@
 Script to extract structured data from industrial asset photographs using
 an advanced ensemble of local OCR (Tesseract) and a multimodal LLM (GPT-4o).
 
-This version introduces sophisticated improvements for data accuracy:
-- Advanced image pre-processing including perspective correction and CLAHE.
-- An ensemble extraction model that uses a decision engine to weigh OCR and LLM results.
-- Chain-of-Thought LLM prompting for higher-quality AI analysis.
-- Post-extraction data validation to ensure plausibility.
+This version introduces a critical architectural change for improved accuracy:
+- Decoupled image processing: The LLM now receives the original image, while
+  Tesseract receives a specifically pre-processed version.
+- Stricter post-processing of LLM results to handle 'None'/'N/A' values.
+- Advanced pre-processing, ensemble model, CoT prompting, and validation remain.
 """
 
 import os
@@ -45,7 +45,7 @@ class Config:
     ENV_PATH = os.path.join(ROOT_DEV_PATH, "API/OpenAI_key_bryan.env")
 
     # --- Database ---
-    DB_TABLE = "sdi_dataset_ME"
+    DB_TABLE = "sdi_dataset"
 
     # --- File Matching ---
     VALID_SUFFIXES = {"0", "1", "3"}
@@ -55,8 +55,11 @@ class Config:
     )
 
     # --- OCR & Image Processing ---
-    UBC_TAG_PATTERN = re.compile(r"\b([A-Z]{1,3})[-\u2013]?\s?(\d{1,4})([A-Z]?)\b")
-    TESSERACT_MIN_CONFIDENCE = 75.0  # Increased threshold as we now have a better LLM fallback
+    UBC_TAG_PATTERNS: List[str] = [
+        r"([A-Z]{2,3}-[A-Z0-9]+-[0-9]+)",  # Format: FH-B124-1, FEF-B1-01
+        r"([A-Z]{1,3}-\d{1,4}[A-Z]?)"      # Format: UBC-1234A, EM-567
+    ]
+    TESSERACT_MIN_CONFIDENCE = 75.0
 
     # --- OpenAI API ---
     OPENAI_MODEL = "gpt-4o"
@@ -73,6 +76,11 @@ class Config:
     }
     EXPECTED_FIELDS: List[str] = list(FIELD_SOURCES.keys())
     YEAR_VALIDATION_RANGE = (1950, 2025)
+    
+    # --- Completeness Score ---
+    COMPLETENESS_SCORE_FIELDS: List[str] = [
+        "Manufacturer", "Model", "Serial Number", "Year", "UBC Tag"
+    ]
 
 
 # --- [2] Setup Logging and Environment ---
@@ -107,7 +115,6 @@ class AssetProcessor:
         logging.info(f"Loaded {len(self.approved_qrs)} approved QR codes to ignore.")
 
     def _load_approved_qrs(self) -> Set[str]:
-        # ... (same as previous version, no changes needed)
         approved = set()
         if not os.path.exists(Config.DB_PATH):
             logging.warning(f"Database not found: {Config.DB_PATH}. Proceeding without approval filter.")
@@ -116,17 +123,16 @@ class AssetProcessor:
             with closing(sqlite3.connect(Config.DB_PATH)) as conn:
                 conn.row_factory = sqlite3.Row
                 with closing(conn.cursor()) as cur:
-                    query = f"SELECT QR_code_ID FROM {Config.DB_TABLE} WHERE Approved = 1 OR Approved = '1'"
+                    query = f'SELECT "QR Code" FROM {Config.DB_TABLE} WHERE Approved = 1 OR Approved = \'1\''
                     cur.execute(query)
                     for row in cur.fetchall():
-                        if qrid := str(row["QR_code_ID"]).strip():
+                        if qrid := str(row["QR Code"]).strip():
                             approved.add(qrid)
         except sqlite3.Error as e:
             logging.error(f"Error reading approvals from DB: {e}.")
         return approved
         
     def discover_assets(self) -> Dict[str, Dict[str, Any]]:
-        # ... (same as previous version, no changes needed)
         grouped = defaultdict(lambda: {"images": {}, "building": "", "asset_type": ""})
         logging.info(f"Scanning for images in: {Config.IMAGE_FOLDER}")
         for filename in sorted(os.listdir(Config.IMAGE_FOLDER)):
@@ -159,7 +165,7 @@ class AssetProcessor:
                     if output_data := future.result():
                         self._save_result(output_data)
                         saved_count += 1
-                        logging.info(f"Successfully processed and saved asset QR: {qr}")
+                        logging.info(f"Successfully processed and saved asset QR: {qr} (Completeness: {output_data['completeness_score']:.0f}%)")
                 except Exception as e:
                     logging.error(f"Failed to process asset QR {qr}: {e}", exc_info=True)
         
@@ -175,17 +181,17 @@ class AssetProcessor:
 
             logging.info(f"Processing image {os.path.basename(path)} for fields: {fields_for_seq}")
             
-            # --- The new ensemble extraction logic ---
-            preprocessed_img = self._preprocess_image(path)
-            if preprocessed_img is None:
-                logging.warning(f"Could not read or preprocess image {path}, skipping.")
+            original_img = cv2.imread(path)
+            if original_img is None:
+                logging.warning(f"Could not read image {path}, skipping.")
                 continue
 
-            # 1. Get OCR opinion
-            tesseract_results = self._tesseract_read_all(preprocessed_img, fields_for_seq)
+            # 1. Get OCR opinion using a pre-processed image optimized for Tesseract
+            tesseract_img = self._preprocess_for_ocr(original_img, os.path.basename(path))
+            tesseract_results = self._tesseract_read_all(tesseract_img, fields_for_seq)
 
-            # 2. Get LLM opinion
-            llm_results = self._llm_extract_fields(preprocessed_img, fields_for_seq, path)
+            # 2. Get LLM opinion using the ORIGINAL image for best results
+            llm_results = self._llm_extract_fields(original_img, fields_for_seq, path)
 
             # 3. Use Decision Engine to choose the best result for each field
             for field in fields_for_seq:
@@ -195,40 +201,47 @@ class AssetProcessor:
                 best_value = self._decision_engine(field, tess_result, llm_result)
                 final_data[field] = best_value
         
-        # 4. Post-Extraction Validation and Normalization
         final_data = self._validate_and_normalize(final_data)
+        
+        completeness_score = self._calculate_completeness_score(final_data)
         
         return {
             "qr_code": qr, "building_number": info.get("building", ""),
             "asset_type": f"- {info.get('asset_type', 'ME').upper()}",
             "structured_data": final_data,
+            "completeness_score": completeness_score,
         }
     
+    def _calculate_completeness_score(self, data: Dict[str, str]) -> float:
+        """Calculates the percentage of key fields that are present."""
+        if not Config.COMPLETENESS_SCORE_FIELDS:
+            return 100.0
+            
+        present_count = sum(1 for field in Config.COMPLETENESS_SCORE_FIELDS if data.get(field, "").strip())
+        total_fields = len(Config.COMPLETENESS_SCORE_FIELDS)
+        
+        return (present_count / total_fields) * 100
+
     def _decision_engine(self, field: str, tess_result: Tuple[str, float], llm_result: Dict[str, Any]) -> str:
         """Intelligently chooses the best value between Tesseract and LLM outputs."""
         tess_val, tess_conf = tess_result
         llm_val, llm_conf = llm_result.get("value", ""), llm_result.get("confidence", 0)
 
-        # Normalize for comparison (e.g., remove spaces, hyphens)
         tess_norm = re.sub(r'[\s-]', '', (tess_val or "")).lower()
         llm_norm = re.sub(r'[\s-]', '', (llm_val or "")).lower()
 
-        # Case 1: They agree. High confidence.
+        if llm_conf >= 80:
+            logging.info(f"[{field}] High confidence LLM result: '{llm_val}' (Conf: {llm_conf}%)")
+            return llm_val
+            
         if tess_norm and tess_norm == llm_norm:
             logging.info(f"[{field}] Agreement between OCR & LLM: '{tess_val}'")
             return tess_val
 
-        # Case 2: Tesseract is highly confident.
         if tess_conf >= Config.TESSERACT_MIN_CONFIDENCE:
             logging.info(f"[{field}] High confidence OCR result: '{tess_val}' (Conf: {tess_conf:.1f}%)")
             return tess_val
-
-        # Case 3: LLM is highly confident and Tesseract is not.
-        if llm_conf >= 80:
-            logging.info(f"[{field}] High confidence LLM result: '{llm_val}' (Conf: {llm_conf}%)")
-            return llm_val
         
-        # Case 4: Fallback to the most plausible non-empty result. Prefer LLM.
         final_choice = llm_val or tess_val
         logging.warning(f"[{field}] Conflicting results. OCR: '{tess_val}' ({tess_conf:.1f}%), "
                         f"LLM: '{llm_val}' ({llm_conf}%). Choosing: '{final_choice}'")
@@ -236,7 +249,6 @@ class AssetProcessor:
 
     def _validate_and_normalize(self, data: Dict[str, str]) -> Dict[str, str]:
         """Performs final validation and normalization on the extracted data."""
-        # Validate Year
         if year_str := data.get("Year"):
             try:
                 year = int(year_str)
@@ -245,16 +257,14 @@ class AssetProcessor:
                     logging.warning(f"Year '{year}' is outside valid range {Config.YEAR_VALIDATION_RANGE}. Discarding.")
                     data["Year"] = ""
             except (ValueError, TypeError):
-                data["Year"] = self._normalize_year(year_str) # Attempt to fix
+                data["Year"] = self._normalize_year(year_str)
         
-        # Normalize UBC Tag
         if ubc_tag := data.get("UBC Tag"):
             data["UBC Tag"] = self._canonicalize_ubc_tag(ubc_tag)
             
         return data
 
     def _save_result(self, data: Dict[str, Any]):
-        # ... (same as previous version, no changes needed)
         qr, asset_type, building = data["qr_code"], data["asset_type"].replace("- ", ""), data["building_number"]
         json_filename = f"{qr}_{asset_type}_{building}.json"
         out_path = os.path.join(Config.OUTPUT_FOLDER, json_filename)
@@ -263,52 +273,40 @@ class AssetProcessor:
 
     # --- [4] Image Processing and Extraction Methods ---
 
-    def _preprocess_image(self, image_path: str) -> Optional[np.ndarray]:
-        """Loads and applies a full suite of pre-processing filters."""
-        img = cv2.imread(image_path)
-        if img is None: return None
-
-        # 1. Perspective Correction
-        corrected_img = self._correct_perspective(img)
-        
-        # 2. Convert to Grayscale
+    def _preprocess_for_ocr(self, image_data: np.ndarray, original_filename: str) -> np.ndarray:
+        """Applies a suite of pre-processing filters optimized for Tesseract OCR."""
+        corrected_img = self._correct_perspective(image_data)
         gray = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2GRAY)
-        
-        # 3. Enhance Contrast with CLAHE
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
-        
-        # 4. Final Thresholding
         _, bw_img = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Save debug image
-        debug_path = os.path.join(Config.DEBUG_FOLDER, f"preprocessed_{os.path.basename(image_path)}")
+        
+        debug_path = os.path.join(Config.DEBUG_FOLDER, f"preprocessed_{original_filename}")
         cv2.imwrite(debug_path, bw_img)
-
         return bw_img
         
     def _correct_perspective(self, image: np.ndarray) -> np.ndarray:
-        """Finds the largest quadrilateral in an image and transforms it to a top-down view."""
-        # ... (This is a complex CV task, here's a simplified robust implementation)
+        """Finds the largest quadrilateral and transforms it to a top-down view."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edged = cv2.Canny(blurred, 50, 150)
 
         contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return image # No contours, return original
+        if not contours: return image
         
         contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
         
+        screenCnt = None
         for c in contours:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4: # Found a quadrilateral
+            if len(approx) == 4:
                 screenCnt = approx
                 break
-        else:
-            return image # No 4-sided contour found, return original
+        
+        if screenCnt is None:
+            return image
 
-        # Order the points
         pts = screenCnt.reshape(4, 2)
         rect = np.zeros((4, 2), dtype="float32")
         s = pts.sum(axis=1)
@@ -332,72 +330,75 @@ class AssetProcessor:
         ], dtype="float32")
         
         M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-        
-        return warped
+        return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
     def _tesseract_read_all(self, bw_img: np.ndarray, fields: List[str]) -> Dict[str, Tuple[str, float]]:
         """Runs Tesseract once and attempts to parse all required fields."""
         results = {}
         try:
-            # Use PSM 6 for a uniform block of text
-            data = pytesseract.image_to_data(bw_img, config='--psm 6', output_type=pytesseract.Output.DICT)
-            full_text = " ".join(filter(None, data['text']))
+            full_text = pytesseract.image_to_string(bw_img, config='--psm 6')
 
-            # Simple keyword-based extraction from the full text
             for field in fields:
                 if field == "UBC Tag":
                     val = self._canonicalize_ubc_tag(full_text)
-                    results[field] = (val, 80.0 if val else 0.0) # Assume high confidence if format matches
-                # Add more keyword logic for other fields if patterns exist
+                    results[field] = (val, 80.0 if val else 0.0)
                 
         except pytesseract.TesseractError as e:
             logging.warning(f"Tesseract error: {e}")
         return results
 
-    def _llm_extract_fields(self, image: np.ndarray, fields: List[str], original_path: str) -> Dict[str, Any]:
-        """Uses the LLM with Chain-of-Thought prompting for robust extraction."""
+    def _llm_extract_fields(self, original_image: np.ndarray, fields: List[str], original_path: str) -> Dict[str, Any]:
+        """Uses the LLM with the original image for robust extraction."""
         fields_list = ", ".join(f'"{f}"' for f in fields)
         prompt = f"""
-Analyze the provided image of an asset nameplate. Your task is to extract the following fields: {fields_list}.
+Analyze the provided image of an asset nameplate or label. Your task is to extract the following fields: {fields_list}.
 
 Follow these steps carefully:
-1.  **Reasoning**: Describe what you see. Identify potential values for each requested field. Note any ambiguities, glare, or unreadable text.
+1.  **Reasoning**: Describe what you see. Identify potential values for each requested field.
+    - Pay close attention to prominent logos or stylized text, as this often indicates the **Manufacturer**.
+    - The **'UBC Tag'** is an asset identifier (e.g., 'FH-B124-1' or 'UBC-1234') and may be on a separate label near keywords like 'Fume Hood' or 'Asset ID'.
+    - Note any ambiguities, glare, or unreadable text. If a field is not present, state that clearly.
 2.  **Confidence Score**: For each field, provide a confidence score from 0 (not found) to 100 (perfectly clear).
-3.  **Extraction**: Provide the final extracted data in a strict JSON object.
+3.  **Extraction**: Provide the final extracted data in a strict JSON object. If a value is not found, use an empty string "".
 
 Your final output MUST be a single JSON object with three keys: "reasoning", "confidence_scores", and "extracted_data".
 
 Example format:
 {{
-  "reasoning": "The image shows a metal nameplate. The 'Manufacturer' is clearly 'ACME Inc.'. The 'Serial Number' seems to be 'XYZ-12345', but the last digit is slightly blurred. The 'Year' is not visible.",
+  "reasoning": "The image shows a metal nameplate. The manufacturer appears to be 'Hawkins' from the logo. The 'Model No' is 111-72SW and the 'SR#' is 0268-24176.",
   "confidence_scores": {{
-    "Manufacturer": 100,
-    "Serial Number": 85,
-    "Year": 0
+    "Manufacturer": 95,
+    "Model": 100,
+    "Serial Number": 100,
+    "Year": 90
   }},
   "extracted_data": {{
-    "Manufacturer": "ACME Inc.",
-    "Serial Number": "XYZ-12345",
-    "Year": ""
+    "Manufacturer": "Hawkins",
+    "Model": "111-72SW",
+    "Serial Number": "0268-24176",
+    "Year": "2024"
   }}
 }}
 """
-        response = self._call_vision_api(prompt, original_path, image, max_tokens=600)
+        response = self._call_vision_api(prompt, original_path, original_image, max_tokens=600)
         
-        # Combine extracted data and confidence scores for the decision engine
         data = response.get("extracted_data", {})
         confidences = response.get("confidence_scores", {})
         
-        # Ensure data is in the expected format
-        if not isinstance(data, dict):
+        # Clean the returned data from the LLM
+        cleaned_data = {}
+        if isinstance(data, dict):
+            for field, value in data.items():
+                str_val = str(value).strip()
+                if str_val.lower() in ["none", "n/a", "null", ""]:
+                    cleaned_data[field] = ""
+                else:
+                    cleaned_data[field] = str_val
+        else:
             logging.warning(f"LLM returned malformed 'extracted_data': {data}")
-            data = {}
-        if not isinstance(confidences, dict):
-            confidences = {}
-            
+
         return {
-            field: {"value": str(data.get(field, "")), "confidence": confidences.get(field, 0)}
+            field: {"value": cleaned_data.get(field, ""), "confidence": confidences.get(field, 0)}
             for field in fields
         }
 
@@ -448,12 +449,14 @@ Example format:
 
     @staticmethod
     def _canonicalize_ubc_tag(text: str) -> str:
+        """Finds a UBC tag in text by trying multiple regex patterns."""
         if not text: return ""
-        normalized = text.replace("—", "-").replace("–", "-").replace(" ", "")
-        match = Config.UBC_TAG_PATTERN.search(normalized)
-        if not match: return ""
-        left, num, suffix = match.groups()
-        return f"{left}-{num}{suffix}".strip("-")
+        
+        for pattern in Config.UBC_TAG_PATTERNS:
+            if match := re.search(pattern, text, re.IGNORECASE):
+                return match.group(1).upper().replace(" ", "")
+        
+        return ""
 
 # --- [5] Main Execution Block ---
 if __name__ == "__main__":
