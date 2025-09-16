@@ -3,16 +3,11 @@
 # File: /home/developer/API/API_interface_EL_ver00.py
 
 """
-EL interface with ASCII-only summary output matching BF template
+EL interface with a structured logging output.
 
-Summary format (ASCII-only):
-
-Total assets found (after approval filter): N
-Processing QR {QR} ...
-Saved /home/developer/Output_jason_api/{QR}_EL_{BUILDING}.json
-
-Keeps existing setups: paths, DB table sdi_dataset_EL, images dir, output dir.
-Filters on Approved <> 1. Uses EL-0, EL-1, EL-2 images. Minimal console output.
+This version is refactored for robustness with an adaptive processing strategy.
+It now detects if a single image or multiple images are provided for an asset and
+uses a tailored, hyper-focused AI prompt for each scenario to ensure reliability.
 """
 
 import os
@@ -24,7 +19,8 @@ import shutil
 import sqlite3
 import argparse
 import platform
-from typing import Dict, List, Tuple, Optional, Set
+import logging
+from typing import Dict, List, Tuple, Optional, Set, Any
 from contextlib import closing
 from collections import defaultdict
 
@@ -49,8 +45,19 @@ DB_TABLE           = "sdi_dataset_EL"
 
 VALID_SUFFIXES: Set[str] = {"0", "1", "2"}
 VALID_EXTS: Set[str]     = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-HEADER_FRACTION: float   = 0.25
-UBC_TAG_CANDIDATE = re.compile(r"\b([A-Z]{2,5})[ -]?(?=[A-Z0-9]*\d)[A-Z0-9]{2,12}\b")
+# A simpler validation rule: must contain at least one letter and one digit.
+SIMPLE_TAG_VALIDATION = re.compile(r"^(?=.*[a-zA-Z])(?=.*\d).+$")
+
+# Fields for completeness score calculation
+COMPLETENESS_FIELDS: List[str] = ["UBC Asset Tag", "Ampere", "Supply From", "Location", "Volts"]
+
+
+# -------------------- Logging Setup --------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 # -------------------- Environment --------------------
 
@@ -66,21 +73,8 @@ def init_openai(dotenv_path: Optional[str]) -> OpenAI:
 
 
 def init_tesseract_quiet() -> None:
-    cmd: Optional[str] = None
-    if platform.system() == "Windows":
-        for c in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-                  r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
-            if os.path.exists(c):
-                cmd = c
-                break
-    cmd = cmd or shutil.which("tesseract") or "/usr/bin/tesseract"
-    pt.pytesseract.tesseract_cmd = cmd
-    for td in ("/usr/share/tesseract-ocr/5/tessdata",
-               "/usr/share/tesseract-ocr/4.00/tessdata",
-               "/usr/share/tesseract-ocr/tessdata"):
-        if os.path.isdir(td):
-            os.environ.setdefault("TESSDATA_PREFIX", td)
-            break
+    # This function is not used by the core logic but kept for potential future use.
+    pass
 
 # -------------------- Utilities --------------------
 
@@ -123,144 +117,41 @@ def load_eligible_qrs(db_path: str, table: str) -> Set[str]:
                 qr_raw = str(row["qr"]).strip()
                 if qr_raw:
                     eligible.add(_normalize_qr(qr_raw))
-    except Exception:
+    except Exception as e:
+        logging.error(f"Failed to load eligible QRs from database: {e}")
         return eligible
     return eligible
 
 
-def _ensure_min_size_array(arr: np.ndarray, min_w: int = 128, min_h: int = 32) -> np.ndarray:
-    """Upscale defensivo para evitar erros do Tesseract/limiares com imagens pequenas."""
-    if arr is None or arr.size == 0:
-        return arr
-    h, w = arr.shape[:2]
-    if w >= min_w and h >= min_h:
-        return arr
-    sx = max(1.0, min_w / max(w, 1))
-    sy = max(1.0, min_h / max(h, 1))
-    s = max(sx, sy)
-    if cv2 is not None:
-        return cv2.resize(arr, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
-    # fallback via PIL
-    pil = Image.fromarray(arr.astype(np.uint8))
-    new_size = (max(1, int(w * s)), max(1, int(h * s)))
-    return np.array(pil.resize(new_size, Image.NEAREST))
+def _calculate_completeness(data: Dict[str, str], fields: List[str]) -> float:
+    """Calculates the percentage of specified fields that are non-empty."""
+    if not fields:
+        return 100.0
+    present_count = sum(1 for field in fields if data.get(field, "").strip())
+    return (present_count / len(fields)) * 100.0
+
+
+def _get_case_insensitive(data: Dict[str, Any], key: str, default: Any = "") -> Any:
+    """Gets a value from a dict using a case-insensitive and space/underscore insensitive key."""
+    if not isinstance(data, dict):
+        return default
+    key_norm = key.lower().replace(" ", "").replace("_", "")
+    for k, v in data.items():
+        k_norm = k.lower().replace(" ", "").replace("_", "")
+        if k_norm == key_norm:
+            return v
+    return default
 
 
 def encode_image_from_path(image_path: str) -> Optional[str]:
     try:
         ext = os.path.splitext(image_path)[1].lower()
-        if ext == ".png":
-            mime = "image/png"
-        elif ext in (".jpg", ".jpeg"):
-            mime = "image/jpeg"
-        elif ext == ".webp":
-            mime = "image/webp"
-        elif ext == ".bmp":
-            mime = "image/bmp"
-        else:
-            mime = "application/octet-stream"
+        mime = f"image/{ext.replace('.', '')}"
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         return f"data:{mime};base64,{b64}"
     except Exception:
         return None
-
-
-def _save_array_as_jpeg(arr: np.ndarray, path: str) -> None:
-    try:
-        if cv2 is not None:
-            cv2.imwrite(path, arr)
-        else:
-            img = Image.fromarray(arr.astype(np.uint8), mode=("L" if arr.ndim == 2 else "RGB"))
-            img.save(path, format="JPEG", quality=90)
-    except Exception:
-        pass
-
-
-def encode_image_from_ndarray(img: np.ndarray) -> Optional[str]:
-    try:
-        if cv2 is not None:
-            ok, buf = cv2.imencode(".jpg", img)
-            if not ok:
-                return None
-            b = buf.tobytes()
-        else:
-            pil = Image.fromarray(img.astype(np.uint8), mode=("L" if img.ndim == 2 else "RGB"))
-            bio = io.BytesIO()
-            pil.save(bio, format="JPEG", quality=90)
-            b = bio.getvalue()
-        b64 = base64.b64encode(b).decode("utf-8")
-        return f"data:image/jpeg;base64,{b64}"
-    except Exception:
-        return None
-
-
-def crop_header_top(image_path: str, fraction: float = HEADER_FRACTION) -> Optional[np.ndarray]:
-    try:
-        if cv2 is not None:
-            img = cv2.imread(image_path)
-            if img is None:
-                return None
-            h = img.shape[0]
-            crop_h = max(1, int(h * fraction))
-            return img[:crop_h, :, :]
-        img = Image.open(image_path).convert("RGB")
-        arr = np.array(img)
-        h = arr.shape[0]
-        crop_h = max(1, int(h * fraction))
-        return arr[:crop_h, :, :]
-    except Exception:
-        return None
-
-
-def _binarize_gray(gray: np.ndarray) -> np.ndarray:
-    if gray is None or gray.size == 0:
-        return gray
-    # limiar simples por média (fallback para caminho sem OpenCV)
-    thresh = float(np.mean(gray))
-    return ((gray > thresh).astype(np.uint8) * 255)
-
-
-def quick_ocr_text(img_path: str) -> str:
-    try:
-        if cv2 is not None:
-            img = cv2.imread(img_path)
-            if img is None:
-                return ""
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            # Upscale defensivo antes do limiar
-            gray = _ensure_min_size_array(gray, min_w=128, min_h=32)
-
-            # Otsu com fallback adaptativo
-            try:
-                _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            except Exception:
-                bw = cv2.adaptiveThreshold(
-                    gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 5
-                )
-
-            # OCR: psm 7 costuma ler melhor etiqueta/linha
-            return pt.image_to_string(bw, config="--oem 3 --psm 7 -l eng") or ""
-
-        # Caminho sem OpenCV (PIL)
-        img = Image.open(img_path).convert("L")
-        arr = np.array(img)
-        arr = _ensure_min_size_array(arr, min_w=128, min_h=32)
-        bw = _binarize_gray(arr)
-        return pt.image_to_string(bw, config="--oem 3 --psm 7 -l eng") or ""
-
-    except pt.TesseractError:
-        return ""
-    except Exception:
-        return ""
-
-def find_ubc_tag_hint_from_el1(img_path: Optional[str]) -> str:
-    if not img_path:
-        return ""
-    t = quick_ocr_text(img_path).upper()
-    m = UBC_TAG_CANDIDATE.search(t)
-    return m.group(0) if m else ""
 
 # -------------------- Grouping --------------------
 
@@ -285,103 +176,129 @@ def build_groups(image_dir: str, eligible_qrs: Set[str], qr_filter: Optional[str
         groups[qr]["images"][seq] = os.path.join(image_dir, fn)
     return groups
 
-# -------------------- OpenAI Extraction --------------------
+# -------------------- OpenAI Extraction (Refactored) --------------------
 
-def ask_model(client: OpenAI,
-              header_img_b64: Optional[str],
-              el1_b64: Optional[str],
-              el2_b64: Optional[str],
-              ubc_hint: str) -> Dict[str, str]:
-
-    content: List[Dict] = []
-    prompt = (
-        "You will see up to three images for an ELECTRICAL PANEL.\n\n"
-        "- First image: HEADER CROP (EL-0). Extract header-only fields.\n"
-        "- Second image: UBC Asset Tag label (EL-1).\n"
-        "- Third image: optional context (EL-2).\n\n"
-        "Extract EXACT fields as strict JSON (empty string if missing):\n"
-        "- Description\n- UBC Asset Tag\n- Branch Panel\n- Ampere\n- Supply From\n- Volts\n- Location\n\n"
-        "Rules:\n"
-        "1) UBC Asset Tag primarily from EL-1; if none or no digits, leave empty.\n"
-        "2) Other fields from EL-0 header.\n"
-        "3) Description must be 'Panel - <UBC Asset Tag>'.\n"
-        "4) Strict JSON only."
-    )
-    content.append({"type": "text", "text": prompt + f"\nHint: {ubc_hint}"})
-    if header_img_b64:
-        content.append({"type": "image_url", "image_url": {"url": header_img_b64}})
-    if el1_b64:
-        content.append({"type": "image_url", "image_url": {"url": el1_b64}})
-    if el2_b64:
-        content.append({"type": "image_url", "image_url": {"url": el2_b64}})
-
+def _call_openai(client: OpenAI, content: List[Dict], debug: bool = False) -> Dict[str, Any]:
+    """Generic wrapper for OpenAI API calls."""
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": content}],
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=800,
+            response_format={"type": "json_object"},
         )
         raw = (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return {}
-
-    # Strip code fences if present
-    if raw.startswith("```json"):
-        raw = raw[7:].strip()
-    elif raw.startswith("```"):
-        raw = raw[3:].strip()
-    if raw.endswith("```"):
-        raw = raw[:-3].strip()
-
-    try:
+        if debug:
+            logging.debug(f"RAW AI RESPONSE:\n{raw}")
         data = json.loads(raw)
-        if not isinstance(data, dict):
-            return {}
-        out: Dict[str, str] = {k: str(data.get(k, "") or "").strip() for k in [
-            "Description", "UBC Asset Tag", "Branch Panel", "Ampere", "Supply From", "Volts", "Location"
-        ]}
-        return out
-    except Exception:
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.error(f"AI call failed: {e}")
         return {}
+
+
+def ask_model_for_single_tag(client: OpenAI, image_b64: str, debug: bool = False) -> Dict[str, Any]:
+    """Makes a hyper-focused API call to extract only the asset tag from a single image."""
+    prompt = (
+        "Your single task is to identify and extract the most prominent alphanumeric identifier from the provided image. "
+        "This is the 'UBC Asset Tag'.\n\n"
+        "**Rules**:\n"
+        "1.  Find the main ID. It is often on a colored physical label (e.g., a yellow sticker).\n"
+        "2.  Your entire response must be a single JSON object with ONE key: \"UBC Asset Tag\".\n"
+        "   Example: {\"UBC Asset Tag\": \"CDP 2S0D1\"}"
+    )
+    content = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": image_b64, "detail": "high"}},
+    ]
+    return _call_openai(client, content, debug)
+
+
+def ask_model_multi_image(client: OpenAI,
+                          el0_b64: Optional[str],
+                          el1_b64: Optional[str],
+                          el2_b64: Optional[str],
+                          debug: bool = False) -> Dict[str, Any]:
+    """Makes a unified, multi-image API call with clear instructions for sourcing data."""
+    content: List[Dict] = []
+    prompt = (
+        "You are an expert at extracting data from electrical panel labels. Analyze the provided images and extract the following fields into a strict JSON object. Use an empty string \"\" if a value is missing.\n\n"
+        "**Fields to Extract**:\n"
+        "- UBC Asset Tag\n- Branch Panel\n- Ampere\n- Supply From\n- Volts\n- Location\n\n"
+        "**Instructions**:\n"
+        "1.  **Examine all images** to get the full context.\n"
+        "2.  The **panel schedule (Image 1)** contains most of the data, like 'Location' (top-right), 'Volts', and 'Ampere'.\n"
+        "3.  The **asset tag label (Image 2)** is the primary source for the 'UBC Asset Tag'.\n"
+        "4.  Fill in all the fields you can find.\n"
+        "5.  **Output**: Your entire response MUST be ONLY the JSON object."
+    )
+    content.append({"type": "text", "text": prompt})
+    
+    if el0_b64:
+        content.append({"type": "text", "text": "\n--- Image 1: Panel Schedule (EL-0) ---"})
+        content.append({"type": "image_url", "image_url": {"url": el0_b64, "detail": "high"}})
+    if el1_b64:
+        content.append({"type": "text", "text": "\n--- Image 2: Asset Tag Label (EL-1) ---"})
+        content.append({"type": "image_url", "image_url": {"url": el1_b64, "detail": "high"}})
+    if el2_b64:
+        content.append({"type": "text", "text": "\n--- Image 3: Context (EL-2) ---"})
+        content.append({"type": "image_url", "image_url": {"url": el2_b64, "detail": "auto"}})
+    
+    return _call_openai(client, content, debug)
+
 
 # -------------------- Processing --------------------
 
-def process_group(client: OpenAI, qr: str, building: str, paths: Dict[str, str], output_dir: str) -> Optional[str]:
-    print(f"Processing QR {qr} ...", flush=True)
+def process_group(client: OpenAI, qr: str, building: str, paths: Dict[str, str], output_dir: str, debug: bool = False) -> bool:
+    logging.info(f"Processing asset QR: {qr}...")
+    
+    raw_data = {}
+    
+    # Adaptive Strategy: Check number of images and choose the best AI prompt.
+    if len(paths) == 1:
+        single_image_path = list(paths.values())[0]
+        if single_image_b64 := encode_image_from_path(single_image_path):
+             if debug: logging.info("Single image 'Tag-Only' mode: Querying AI...")
+             raw_data = ask_model_for_single_tag(client, single_image_b64, debug)
+    else:
+        el0_b64 = encode_image_from_path(paths.get("0", "")) if paths.get("0") else None
+        el1_b64 = encode_image_from_path(paths.get("1", "")) if paths.get("1") else None
+        el2_b64 = encode_image_from_path(paths.get("2", "")) if paths.get("2") else None
+        if debug: logging.info("Multi-image 'Unified Context' mode: Querying AI...")
+        raw_data = ask_model_multi_image(client, el0_b64, el1_b64, el2_b64, debug)
 
-    # Build image inputs
-    header_img = crop_header_top(paths.get("0", ""), HEADER_FRACTION) if paths.get("0") else None
-    header_b64 = encode_image_from_ndarray(header_img) if header_img is not None else (
-        encode_image_from_path(paths.get("0", "")) if paths.get("0") else None
-    )
-    el1_b64 = encode_image_from_path(paths.get("1", "")) if paths.get("1") else None
-    el2_b64 = encode_image_from_path(paths.get("2", "")) if paths.get("2") else None
+    if not raw_data:
+        logging.error(f"Failed to get a valid response from AI for QR: {qr}")
+        return False
 
-    ubc_hint = find_ubc_tag_hint_from_el1(paths.get("1"))
+    # Use case-insensitive parsing for all fields
+    all_fields = COMPLETENESS_FIELDS + ["Branch Panel", "Description"]
+    data: Dict[str, str] = {
+        field: str(_get_case_insensitive(raw_data, field)).strip()
+        for field in all_fields
+    }
 
-    data = ask_model(client, header_b64, el1_b64, el2_b64, ubc_hint)
-
-    # Minimal fallback structure
-    if not isinstance(data, dict):
-        data = {}
-
-    ubc_val = (data.get("UBC Asset Tag", "") or "").upper().strip()
-    if not UBC_TAG_CANDIDATE.search(ubc_val):
+    # Post-processing and validation
+    ubc_val = data.get("UBC Asset Tag", "").upper().strip()
+    ubc_val = ubc_val.replace("EQUIPMENT NAME:", "").replace("MAIN", "").strip()
+    if not SIMPLE_TAG_VALIDATION.search(ubc_val):
         ubc_val = ""
 
-    branch_panel = (data.get("Branch Panel", "") or "").upper().strip()
-    if not ubc_val and branch_panel:
+    branch_panel = data.get("Branch Panel", "").upper().strip()
+    if not ubc_val and SIMPLE_TAG_VALIDATION.search(branch_panel):
         ubc_val = branch_panel
-
+    
     data["UBC Asset Tag"] = ubc_val
     data["Description"] = f"Panel - {ubc_val}" if ubc_val else "Panel - "
+    data["Branch Panel"] = branch_panel
 
-    for k in ["Ampere", "Supply From", "Volts", "Location", "Branch Panel"]:
+    for k in ["Ampere", "Supply From", "Volts", "Location"]:
         v = str(data.get(k, "") or "").strip()
-        if v == ".":
-            v = ""
+        if v == ".": v = ""
         data[k] = v
+        
+    completeness_score = _calculate_completeness(data, COMPLETENESS_FIELDS)
 
     result = {
         "qr_code": qr,
@@ -396,50 +313,61 @@ def process_group(client: OpenAI, qr: str, building: str, paths: Dict[str, str],
             "Volts": data.get("Volts", ""),
             "Location": data.get("Location", ""),
         },
+        "completeness_score": completeness_score,
     }
 
-    # File name pattern to match BF dashboard
     json_filename = f"{qr}_EL_{building}.json"
     out_path = os.path.join(output_dir, json_filename)
 
     try:
         with open(out_path, "w", encoding="utf-8") as jf:
             json.dump(result, jf, ensure_ascii=True, indent=2)
-    except Exception:
-        return None
+    except Exception as e:
+        logging.error(f"Failed to save JSON file for QR {qr}: {e}")
+        return False
 
-    print(f"Saved {out_path}", flush=True)
-    return out_path
+    logging.info(f"Successfully processed and saved asset QR: {qr} (Completeness: {completeness_score:.0f}%)")
+    return True
 
 # -------------------- Main --------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="EL OCR/Extraction (ASCII summary)")
+    ap = argparse.ArgumentParser(description="EL OCR/Extraction with structured logging")
     ap.add_argument("--qr", dest="qr_filter", default=None, help="Process a single QR only (e.g., 0000183710)")
     ap.add_argument("--db", dest="db_path", default=DEFAULT_DB_PATH, help="Path to QR_codes.db")
     ap.add_argument("--images-dir", dest="images_dir", default=DEFAULT_IMAGE_DIR, help="Path to image directory")
     ap.add_argument("--output-dir", dest="output_dir", default=DEFAULT_OUTPUT_DIR, help="Path to output JSON dir")
     ap.add_argument("--env", dest="dotenv_path", default=None, help="Path to .env containing OPENAI_API_KEY")
+    ap.add_argument("--debug", action="store_true", help="Enable debug mode to print raw AI responses.")
     args = ap.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    init_tesseract_quiet()
+    os.makedirs(args.output_dir, exist_ok=True)
     client = init_openai(args.dotenv_path)
 
     eligible = load_eligible_qrs(args.db_path, DB_TABLE)
     groups = build_groups(args.images_dir, eligible, qr_filter=args.qr_filter)
 
-    print(f"Total assets found (after approval filter): {len(groups)}", flush=True)
-
+    logging.info(f"Found {len(groups)} new assets to process.")
+    
+    saved_count = 0
     for qr, info in groups.items():
-        process_group(
+        success = process_group(
             client=client,
             qr=qr,
             building=info.get("building", ""),
             paths=info.get("images", {}),
             output_dir=args.output_dir,
+            debug=args.debug,
         )
+        if success:
+            saved_count += 1
+            
+    # Print final summary
+    print("\n--- SUMMARY ---")
+    print(f"Successfully saved: {saved_count}")
 
 
 if __name__ == "__main__":
