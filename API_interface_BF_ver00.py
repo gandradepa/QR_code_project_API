@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List
 from difflib import get_close_matches
+from datetime import datetime  # <-- Added for timestamps
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -46,6 +47,9 @@ VALID_SUFFIXES = {"0", "1", "3"}
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 VALID_MANUFACTURERS = ["Watts", "Wilkins", "Conbraco", "Apollo"]
+
+# Fields for completeness score calculation
+COMPLETENESS_FIELDS: List[str] = ["Manufacturer", "Model", "Serial Number", "Diameter"]
 
 # Extract these from BOTH 0 and 1 sequences
 FIELD_SOURCES: Dict[str, List[str]] = {
@@ -90,7 +94,7 @@ if SKIP_QRS:
 
 # --- [3] Group files by QR ---
 pattern = re.compile(
-    r"^(\d+)\s+"            # QR (digits, zero-padded)
+    r"^(\d+)\s+"          # QR (digits, zero-padded)
     r"(\d+(?:-\d+)?)\s+"    # Building (digits, optional -digits)
     r"(BF)\s*-\s*([013])$", # BF - sequence (0/1/3)
     re.IGNORECASE
@@ -104,16 +108,13 @@ for fn in os.listdir(image_folder):
         continue
     m = pattern.match(base)
     if not m:
-        print(f"⚠ Skipping unrecognized filename: {fn}")
         continue
 
     qr, building, asset_type, seq = m.groups()
     if seq not in VALID_SUFFIXES or asset_type.upper() != "BF":
         continue
 
-    # Skip if Approved == 1 in sdi_dataset
     if qr in SKIP_QRS:
-        print(f"⏭️  Skipping QR {qr} (Approved=1 in DB)")
         continue
 
     grouped[qr]["building"]    = building
@@ -185,6 +186,13 @@ def ocr_find_diameter(image_path: str) -> str:
         return normalize_diameter(text)
     except Exception:
         return ""
+    
+def _calculate_completeness(data: Dict[str, str], fields: List[str]) -> float:
+    """Calculates the percentage of specified fields that are non-empty."""
+    if not fields:
+        return 100.0
+    present_count = sum(1 for field in fields if data.get(field, "").strip())
+    return (present_count / len(fields)) * 100.0
 
 def ask_model_for_fields(image_path: str, fields: List[str]) -> dict:
     fields_list = "\n".join([f"- {f}" for f in fields])
@@ -219,27 +227,37 @@ Do not include any text before or after the JSON.
                 max_tokens=300
             )
             raw = (resp.choices[0].message.content or "").strip()
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
-            data = json.loads(raw)
+            
+            json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON object found in the model's response.")
+            
+            json_str = json_match.group(0)
+            data = json.loads(json_str)
 
             if "Manufacturer" in data:
                 data["Manufacturer"] = normalize_manufacturer(str(data.get("Manufacturer", "")))
             if "Diameter" in data:
                 data["Diameter"] = normalize_diameter(str(data.get("Diameter", "")))
 
-            return {k: (data.get(k, "") if isinstance(data.get(k, ""), str) else "") for k in fields}
-        except Exception:
+            return {k: (str(data.get(k, "")) if data.get(k) is not None else "") for k in fields}
+
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"  - Attempt {attempt + 1}/4 failed to parse response: {e}. Retrying...")
             time.sleep(1.5 * (attempt + 1))
+        except Exception as e:
+            print(f"  - An unexpected error occurred on attempt {attempt + 1}/4: {e}. Retrying...")
+            time.sleep(1.5 * (attempt + 1))
+            
     return {k: "" for k in fields}
 
+
 # --- [5] Process each asset ---
+saved_count = 0  # <-- Initialize counter
 for qr, info in grouped.items():
-    # Double guard in case grouping changes later
     if qr in SKIP_QRS:
-        print(f"⏭️  Skipping QR {qr} (Approved=1 in DB)")
         continue
 
-    print(f"\nProcessing QR {qr} …")
     result = {
         "Manufacturer": "",
         "Model": "",
@@ -247,7 +265,6 @@ for qr, info in grouped.items():
         "Diameter": ""
     }
 
-    # Try sequences 0 and 1; last non-empty wins
     for seq, path in info["images"].items():
         fields_for_seq = [f for f, srcs in FIELD_SOURCES.items() if seq in srcs]
         if not fields_for_seq:
@@ -261,12 +278,15 @@ for qr, info in grouped.items():
         for k, v in partial.items():
             if isinstance(v, str) and v.strip():
                 result[k] = v.strip()
+    
+    completeness_score = _calculate_completeness(result, COMPLETENESS_FIELDS)
 
     output_data = {
         "qr_code":         qr,
         "building_number": info.get("building", ""),
         "asset_type":      f"- {info.get('asset_type', 'BF').upper()}",
-        "structured_data": result
+        "structured_data": result,
+        "completeness_score": completeness_score
     }
 
     json_filename = f"{qr}_{info.get('asset_type', 'BF').upper()}_{info.get('building', '')}.json"
@@ -275,4 +295,13 @@ for qr, info in grouped.items():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
-    print(f"  ✅ Saved {out_path}")
+    # --- LOGGING CHANGE START ---
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp}] INFO: Successfully processed and saved asset QR: {qr} (Completeness: {completeness_score:.0f}%)")
+    saved_count += 1
+    # --- LOGGING CHANGE END ---
+
+# --- SUMMARY CHANGE START ---
+print("\n--- SUMMARY ---")
+print(f"Successfully saved: {saved_count}")
+# --- SUMMARY CHANGE END ---
