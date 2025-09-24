@@ -64,8 +64,8 @@ logging.basicConfig(
 def init_openai(dotenv_path: Optional[str]) -> OpenAI:
     if dotenv_path and os.path.isfile(dotenv_path):
         load_dotenv(dotenv_path=dotenv_path)
-    elif os.path.isfile("/home/developer/API/OpenAI_key_bryan.env"):
-        load_dotenv(dotenv_path="/home/developer/API/OpenAI_key_bryan.env")
+    elif os.path.isfile("/home/developer/API/OpenAI_key_giba.env"):
+        load_dotenv(dotenv_path="/home/developer/API/OpenAI_key_giba.env")
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not found")
