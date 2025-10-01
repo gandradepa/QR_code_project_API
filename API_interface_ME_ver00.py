@@ -56,8 +56,12 @@ class Config:
 
     # --- OCR & Image Processing ---
     UBC_TAG_PATTERNS: List[str] = [
-        r"([A-Z]{2,3}-[A-Z0-9]+-[0-9]+)",  # Format: FH-B124-1, FEF-B1-01
-        r"([A-Z]{1,3}-\d{1,4}[A-Z]?)"      # Format: UBC-1234A, EM-567
+        # This new pattern accepts a hyphen OR a space as the separator.
+        # It will now match 'HUM 5', 'FC-6.32', and 'FH-B124-1'.
+        r"([A-Z]{1,4}[-\s][\w\.-]+)",
+        
+        # Kept as a fallback.
+        r"([A-Z]{2,3}-[A-Z0-9]+-[0-9]+)"
     ]
     TESSERACT_MIN_CONFIDENCE = 75.0
 
@@ -350,33 +354,40 @@ class AssetProcessor:
     def _llm_extract_fields(self, original_image: np.ndarray, fields: List[str], original_path: str) -> Dict[str, Any]:
         """Uses the LLM with the original image for robust extraction."""
         fields_list = ", ".join(f'"{f}"' for f in fields)
+        
         prompt = f"""
-Analyze the provided image of an asset nameplate or label. Your task is to extract the following fields: {fields_list}.
+Analyze the provided image of an industrial asset. Your primary task is to extract information for these fields: {fields_list}.
 
-Follow these steps carefully:
-1.  **Reasoning**: Describe what you see. Identify potential values for each requested field.
-    - Pay close attention to prominent logos or stylized text, as this often indicates the **Manufacturer**.
-    - The **'UBC Tag'** is an asset identifier (e.g., 'FH-B124-1' or 'UBC-1234') and may be on a separate label near keywords like 'Fume Hood' or 'Asset ID'.
-    - Note any ambiguities, glare, or unreadable text. If a field is not present, state that clearly.
-2.  **Confidence Score**: For each field, provide a confidence score from 0 (not found) to 100 (perfectly clear).
-3.  **Extraction**: Provide the final extracted data in a strict JSON object. If a value is not found, use an empty string "".
+Follow these steps with high precision:
+1.  **Reasoning**: Systematically scan the entire image. Describe what you see, including the main nameplate AND any other stickers, tags, or labels. Note any ambiguities, glare, or unreadable text. If a field is not present, state that clearly.
+
+2.  **Special Instructions for Key Fields**:
+    * **'Year'**: This may be labeled 'Year', 'Mfg. Date', 'Manufactured Date', or '**Production Date**'. You must extract only the four-digit year from the value (e.g., if the date is '2023/07', the year is '2023').
+    * **'Serial Number'**: This may be labeled as 'Serial No.', 'S/N', 'Serial', or similar. **Crucially, if the field next to the label is blank, look for a barcode. The number printed directly below a barcode is almost always the Serial Number.**
+    * **'UBC Tag'**: This field is CRITICAL. It is usually on a separate sticker (white, silver, yellow) and not on the main metal nameplate. Look for formats like 'FH-B124-1', 'FC-6.32', or '**HUM 5**' (note the space instead of a hyphen).
+
+3.  **Confidence Score**: For each field, provide a confidence score from 0 (not found/guess) to 100 (perfectly clear and certain).
+
+4.  **Extraction**: Provide the final extracted data in a strict JSON object. If a value cannot be found for any reason, use an empty string "" for that field.
 
 Your final output MUST be a single JSON object with three keys: "reasoning", "confidence_scores", and "extracted_data".
 
 Example format:
 {{
-  "reasoning": "The image shows a metal nameplate. The manufacturer appears to be 'Hawkins' from the logo. The 'Model No' is 111-72SW and the 'SR#' is 0268-24176.",
+  "reasoning": "The image shows a main nameplate. The 'Production Date' is listed as 2023/07, so I will use 2023 for the Year. The 'Serial No.' field is blank, but a barcode number is present below it.",
   "confidence_scores": {{
     "Manufacturer": 95,
     "Model": 100,
-    "Serial Number": 100,
-    "Year": 90
+    "Serial Number": 98,
+    "Year": 100,
+    "UBC Tag": 0
   }},
   "extracted_data": {{
-    "Manufacturer": "Hawkins",
-    "Model": "111-72SW",
-    "Serial Number": "0268-24176",
-    "Year": "2024"
+    "Manufacturer": "Polar Air",
+    "Model": "PDWA(4R)-800-VX-W-AECM-L",
+    "Serial Number": "6902307100180",
+    "Year": "2023",
+    "UBC Tag": ""
   }}
 }}
 """
