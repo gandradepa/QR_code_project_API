@@ -87,7 +87,8 @@ def _normalize_qr(s: str) -> str:
     return core or "0"
 
 
-def _detect_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, str]:
+def _detect_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, str, str]:
+    """Detects required column names for QR, Approved, and Flagged status."""
     wanted_qr_names = {"QR Code", "QR_code_ID", "QRCode", "QR", "QR_code"}
     cols: Dict[str, str] = {}
     for _, name, *_ in conn.execute(f'PRAGMA table_info("{table}")').fetchall():
@@ -97,21 +98,25 @@ def _detect_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, str]:
         raise RuntimeError(f"QR column not found in {table}")
     if "approved" not in cols:
         raise RuntimeError("Approved column not found")
-    return qr_col, cols["approved"]
+    if "flagged" not in cols:
+        raise RuntimeError("Flagged column not found")
+    return qr_col, cols["approved"], cols["flagged"]
 
 
 def load_eligible_qrs(db_path: str, table: str) -> Set[str]:
+    """Loads QR codes that are neither approved nor flagged."""
     eligible: Set[str] = set()
     if not os.path.exists(db_path):
         return eligible
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
-            qr_col, approved_col = _detect_columns(conn, table)
+            qr_col, approved_col, flagged_col = _detect_columns(conn, table)
             sql = f'''
                 SELECT "{qr_col}" AS qr
                 FROM "{table}"
                 WHERE COALESCE(CAST({approved_col} AS INTEGER), 0) <> 1
+                  AND COALESCE(CAST({flagged_col} AS INTEGER), 0) <> 1
             '''
             for row in conn.execute(sql):
                 qr_raw = str(row["qr"]).strip()

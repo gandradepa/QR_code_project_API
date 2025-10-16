@@ -115,26 +115,27 @@ class AssetProcessor:
 
     def __init__(self):
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.approved_qrs = self._load_approved_qrs()
-        logging.info(f"Loaded {len(self.approved_qrs)} approved QR codes to ignore.")
+        self.qrs_to_ignore = self._load_qrs_to_ignore()
+        logging.info(f"Loaded {len(self.qrs_to_ignore)} QR codes to ignore (approved or flagged).")
 
-    def _load_approved_qrs(self) -> Set[str]:
-        approved = set()
+    def _load_qrs_to_ignore(self) -> Set[str]:
+        """Loads QR codes that are already approved or have been flagged."""
+        to_ignore = set()
         if not os.path.exists(Config.DB_PATH):
-            logging.warning(f"Database not found: {Config.DB_PATH}. Proceeding without approval filter.")
-            return approved
+            logging.warning(f"Database not found: {Config.DB_PATH}. Proceeding without filtering processed assets.")
+            return to_ignore
         try:
             with closing(sqlite3.connect(Config.DB_PATH)) as conn:
                 conn.row_factory = sqlite3.Row
                 with closing(conn.cursor()) as cur:
-                    query = f'SELECT "QR Code" FROM {Config.DB_TABLE} WHERE Approved = 1 OR Approved = \'1\''
+                    query = f'SELECT "QR Code" FROM {Config.DB_TABLE} WHERE Approved = 1 OR Approved = \'1\' OR Flagged = 1 OR Flagged = \'1\''
                     cur.execute(query)
                     for row in cur.fetchall():
                         if qrid := str(row["QR Code"]).strip():
-                            approved.add(qrid)
+                            to_ignore.add(qrid)
         except sqlite3.Error as e:
-            logging.error(f"Error reading approvals from DB: {e}.")
-        return approved
+            logging.error(f"Error reading DB to filter assets: {e}.")
+        return to_ignore
         
     def discover_assets(self) -> Dict[str, Dict[str, Any]]:
         grouped = defaultdict(lambda: {"images": {}, "building": "", "asset_type": ""})
@@ -146,7 +147,7 @@ class AssetProcessor:
             if not match: continue
             qr, building, asset_type, seq = match.groups()
             if asset_type.upper() != "ME" or seq not in Config.VALID_SUFFIXES: continue
-            if qr in self.approved_qrs: continue
+            if qr in self.qrs_to_ignore: continue
             grouped[qr]["building"] = building
             grouped[qr]["asset_type"] = asset_type.upper()
             grouped[qr]["images"][seq] = os.path.join(Config.IMAGE_FOLDER, filename)

@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List
 from difflib import get_close_matches
-from datetime import datetime  # <-- Added for timestamps
+from datetime import datetime
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -42,6 +42,7 @@ DB_PATH  = r"/home/developer/asset_capture_app_dev/data/QR_codes.db"
 DB_TABLE = "sdi_dataset"   # uses a spaced QR column name: "QR Code"
 QR_COL   = '"QR Code"'     # quoted identifier for SQLite
 APPROVED_COL = '"Approved"'
+FLAGGED_COL = '"Flagged"'   # Added Flagged column
 
 VALID_SUFFIXES = {"0", "1", "3"}
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -59,25 +60,26 @@ FIELD_SOURCES: Dict[str, List[str]] = {
     "Diameter": ["0", "1"],
 }
 
-# --- [2.1] DB helpers (filter to Approved <> 1) ---
-def load_disallowed_qrs(db_path: str, table: str, qr_col: str, approved_col: str) -> set:
+# --- [2.1] DB helpers ---
+def load_disallowed_qrs(db_path: str, table: str, qr_col: str, approved_col: str, flagged_col: str) -> set:
     """
-    Return a set of QR values that should be SKIPPED (i.e., Approved == 1).
+    Return a set of QR values that should be SKIPPED (i.e., Approved=1 or Flagged=1).
     We compare as TEXT to catch integer 1 and string '1'.
     """
     to_skip = set()
     if not os.path.exists(db_path):
-        print(f"⚠ DB not found at: {db_path}. Proceeding without approval filter.")
+        print(f"⚠ DB not found at: {db_path}. Proceeding without any asset filter.")
         return to_skip
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             with closing(conn.cursor()) as cur:
-                # Approved == 1 (int) or '1' (text) → skip
+                # Approved=1 OR Flagged=1 (as int or text) → skip
                 sql = f"""
                     SELECT {qr_col} AS qr
                     FROM "{table}"
                     WHERE CAST({approved_col} AS TEXT) = '1'
+                       OR CAST({flagged_col} AS TEXT) = '1'
                 """
                 cur.execute(sql)
                 for row in cur.fetchall():
@@ -85,12 +87,12 @@ def load_disallowed_qrs(db_path: str, table: str, qr_col: str, approved_col: str
                     if qrid:
                         to_skip.add(qrid)
     except Exception as e:
-        print(f"⚠ Error reading approvals from DB: {e}. Proceeding without approval filter.")
+        print(f"⚠ Error reading DB to filter assets: {e}. Proceeding without filter.")
     return to_skip
 
-SKIP_QRS = load_disallowed_qrs(DB_PATH, DB_TABLE, QR_COL, APPROVED_COL)
+SKIP_QRS = load_disallowed_qrs(DB_PATH, DB_TABLE, QR_COL, APPROVED_COL, FLAGGED_COL)
 if SKIP_QRS:
-    print(f"Approval filter loaded: {len(SKIP_QRS)} QR(s) will be skipped (Approved=1).")
+    print(f"Filter loaded: {len(SKIP_QRS)} QR(s) will be skipped (Approved=1 or Flagged=1).")
 
 # --- [3] Group files by QR ---
 pattern = re.compile(
@@ -120,7 +122,7 @@ for fn in os.listdir(image_folder):
     grouped[qr]["building"]    = building
     grouped[qr]["images"][seq] = os.path.join(image_folder, fn)
 
-print(f"\nTotal assets found (after approval filter): {len(grouped)}")
+print(f"\nTotal new assets found to be processed: {len(grouped)}")
 
 # --- [4] Utilities ---
 def encode_image(path: str) -> str:
@@ -253,7 +255,7 @@ Do not include any text before or after the JSON.
 
 
 # --- [5] Process each asset ---
-saved_count = 0  # <-- Initialize counter
+saved_count = 0
 for qr, info in grouped.items():
     if qr in SKIP_QRS:
         continue
@@ -295,13 +297,9 @@ for qr, info in grouped.items():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
-    # --- LOGGING CHANGE START ---
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] INFO: Successfully processed and saved asset QR: {qr} (Completeness: {completeness_score:.0f}%)")
     saved_count += 1
-    # --- LOGGING CHANGE END ---
 
-# --- SUMMARY CHANGE START ---
 print("\n--- SUMMARY ---")
-print(f"Successfully saved: {saved_count}")
-# --- SUMMARY CHANGE END ---
+print(f"Total assets processed and saved: {saved_count}")
